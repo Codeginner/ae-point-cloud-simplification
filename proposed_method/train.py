@@ -75,7 +75,8 @@ def train_one_epoch(
         out   = model(P, compute_loss=True)
         loss  = out["loss"]
 
-        loss["total"].backward()
+        total_loss = loss["total"].mean()
+        total_loss.backward()
         optimizer.step()
 
         for k, v in loss.items():
@@ -84,10 +85,10 @@ def train_one_epoch(
         if step % 50 == 0:
             logger.info(
                 f"Epoch {epoch}  step {step}/{len(loader)}  "
-                f"loss={loss['total'].item():.4f}  "
-                f"cd={loss['chamfer'].item():.4f}  "
-                f"n={loss['normal'].item():.4f}  "
-                f"nc={loss['nc'].item():.4f}"
+                f"loss={loss['total'].mean().item():.4f}  "
+                f"cd={loss['chamfer'].mean().item():.4f}  "
+                f"n={loss['normal'].mean().item():.4f}  "
+                f"nc={loss['nc'].mean().item():.4f}"
             )
 
     n = len(loader)
@@ -202,6 +203,7 @@ def main() -> None:
 
         # Save latest checkpoint
         ckpt_path = ckpt_dir / "latest.pth"
+        state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
         torch.save({
             "epoch":     epoch,
             "model":     model.state_dict(),

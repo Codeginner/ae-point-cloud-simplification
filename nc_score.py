@@ -1,0 +1,169 @@
+"""
+nc_score.py — NC Score Module, adapted from the LoGA attack.
+
+Original LoGA methods (faithfully preserved, just vectorised):
+    estimate_center_distance()              → NCScoreModule.estimate_center_distance()
+    divide_point_cloud_by_center_distance() → NCScoreModule.divide_point_cloud()
+
+LoGA's original implementation uses a Python double-loop over (B, N)
+which is prohibitively slow during training. This module keeps the
+**identical mathematical definition** but rewrites the inner loop as a
+fully vectorised PyTorch operation:
+
+    center_dist[b, i] = || p_i  −  mean( kNN(p_i) ) ||
+
+Scores are then min-max normalised to [0, 1] per batch item so they
+can be fused with DGCNN features in ImportanceScoringMLP.
+
+Class:
+    NCScoreModule
+"""
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+
+class NCScoreModule(nn.Module):
+    """Vectorised re-implementation of LoGA's centre-distance score.
+
+    Computes, for every point p_i:
+
+        s_i = || p_i  −  centroid( k-nearest-neighbours of p_i ) ||
+
+    then normalises per batch item to [0, 1].
+
+    Args:
+        k:   Number of neighbours for centroid estimation.
+             LoGA uses k=16 in ``estimate_center_distance`` and
+             k=20 in ``divide_point_cloud_by_center_distance``.
+             Unified here as a single parameter.
+        eps: Numerical stability for min-max normalisation. Default 1e-8.
+    """
+
+    def __init__(self, k: int = 16, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.k   = k
+        self.eps = eps
+
+    # ------------------------------------------------------------------
+    # Core: vectorised centre-distance  (replaces the Python double loop)
+    # ------------------------------------------------------------------
+
+    def estimate_center_distance(self, points: Tensor) -> Tensor:
+        """Vectorised equivalent of LoGA's ``estimate_center_distance``.
+
+        LoGA original (slow Python loop):
+            for b in range(B):
+                for i in range(N):
+                    dist    = torch.norm(points[b] - points[b, i], dim=1)
+                    knn_idx = torch.topk(dist, k=k+1, largest=False)[1][1:]
+                    knn_pts = points[b, knn_idx]          # [k, 3]
+                    center  = knn_pts.mean(dim=0)
+                    center_dist[b, i] = torch.norm(points[b, i] - center)
+
+        This version produces the exact same result in O(BN²) memory
+        (same as the loop) but fully on-GPU without Python overhead.
+
+        Args:
+            points: (B, N, 3)
+
+        Returns:
+            center_dist: (B, N) — raw (un-normalised) centre distances.
+        """
+        B, N, _ = points.shape
+        k = self.k
+
+        # ── Pairwise squared distances (B, N, N) ──────────────────────
+        # ‖a − b‖² = ‖a‖² − 2aᵀb + ‖b‖²
+        inner = -2.0 * torch.bmm(points, points.transpose(2, 1))  # (B, N, N)
+        sq    = (points ** 2).sum(dim=-1, keepdim=True)            # (B, N, 1)
+        dist2 = (sq + inner + sq.transpose(2, 1)).clamp(min=0.0)   # (B, N, N)
+
+        # ── k+1 nearest (including self), then drop self ───────────────
+        _, knn_idx = dist2.topk(k + 1, dim=-1, largest=False)     # (B, N, k+1)
+        knn_idx    = knn_idx[:, :, 1:]                             # (B, N, k)  — drop self
+
+        # ── Gather neighbour coordinates ───────────────────────────────
+        # points: (B, N, 3)  →  expand to (B, N, N, 3) then gather along dim=2
+        knn_pts = torch.gather(
+            points.unsqueeze(2).expand(B, N, N, 3),               # (B, N, N, 3)
+            2,
+            knn_idx.unsqueeze(-1).expand(B, N, k, 3),             # (B, N, k, 3)
+        )                                                           # (B, N, k, 3)
+
+        # ── Centroid then distance ─────────────────────────────────────
+        centroid    = knn_pts.mean(dim=2)                          # (B, N, 3)
+        center_dist = (points - centroid).norm(dim=-1)             # (B, N)
+
+        return center_dist
+
+    # ------------------------------------------------------------------
+    # Divide into contour / flat subsets  (LoGA's divide method)
+    # ------------------------------------------------------------------
+
+    def divide_point_cloud(
+        self,
+        points:      Tensor,
+        contour_num: int = 512,
+        flat_num:    int = 512,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Vectorised equivalent of LoGA's ``divide_point_cloud_by_center_distance``.
+
+        Splits the point cloud into:
+            • **contour** points — highest centre-distance (edges / corners)
+            • **flat** points   — lowest  centre-distance (smooth regions)
+
+        LoGA original uses a Python loop over batch items; this version
+        is fully batched.
+
+        Args:
+            points:      (B, N, 3) or (B, N, 6) — only xyz [:, :, :3] used.
+            contour_num: Points with largest  s_i. Default 512.
+            flat_num:    Points with smallest s_i. Default 512.
+
+        Returns:
+            flat_sets:       (B, flat_num,    3)
+            contour_sets:    (B, contour_num, 3)
+            flat_indices:    (B, flat_num)
+            contour_indices: (B, contour_num)
+            center_dist:     (B, N)  — raw per-point centre distances
+        """
+        pts         = points[:, :, :3]                              # (B, N, 3)
+        center_dist = self.estimate_center_distance(pts)            # (B, N)
+
+        # Sort descending: highest score first  (mirrors LoGA's argsort descending)
+        sorted_idx      = torch.argsort(center_dist, dim=1, descending=True)  # (B, N)
+        contour_indices = sorted_idx[:, :contour_num]              # (B, contour_num)
+        flat_indices    = sorted_idx[:, -flat_num:]                # (B, flat_num)
+
+        def _gather_pts(src: Tensor, idx: Tensor) -> Tensor:
+            """src: (B, N, 3), idx: (B, M) → (B, M, 3)"""
+            return torch.gather(src, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
+
+        contour_sets = _gather_pts(pts, contour_indices)           # (B, contour_num, 3)
+        flat_sets    = _gather_pts(pts, flat_indices)               # (B, flat_num,    3)
+
+        return flat_sets, contour_sets, flat_indices, contour_indices, center_dist
+
+    # ------------------------------------------------------------------
+    # Forward — normalised score for ImportanceScoringMLP
+    # ------------------------------------------------------------------
+
+    def forward(self, P: Tensor) -> Tensor:
+        """Compute normalised NC scores for use in ImportanceScoringMLP.
+
+        Args:
+            P: Input point cloud (B, N, 3).
+
+        Returns:
+            s_norm: Per-point NC scores (B, N) in [0, 1].
+        """
+        s_raw  = self.estimate_center_distance(P)                  # (B, N)
+
+        # Min-max normalisation per batch item → [0, 1]
+        s_min  = s_raw.min(dim=1, keepdim=True).values
+        s_max  = s_raw.max(dim=1, keepdim=True).values
+        s_norm = (s_raw - s_min) / (s_max - s_min + self.eps)
+
+        return s_norm                                               # (B, N)

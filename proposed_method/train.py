@@ -162,6 +162,10 @@ def main() -> None:
 
     # ── Model ─────────────────────────────────────────────────────────
     model = PointCloudSimplifier(M=args.M, k=args.k).to(device)
+    
+    if torch.cuda.device_count() > 1:
+        print(f"Pakai {torch.cuda.device_count()} GPU")
+        model = torch.nn.DataParallel(model)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)

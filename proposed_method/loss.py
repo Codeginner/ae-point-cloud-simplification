@@ -112,13 +112,16 @@ class NormalConsistencyLoss(nn.Module):
         centroid    = neighbours.mean(dim=2, keepdim=True)      # (B, N, 1, 3)
         centred     = neighbours - centroid                      # (B, N, k, 3)
 
-        # Covariance matrix (B, N, 3, 3)
-        cov = torch.einsum("bnkc,bnkd->bncd", centred, centred) / self.k
+        # SVD on centred neighbourhood matrix — lebih stabil di DataParallel
+        # centred: (B, N, k, 3) → reshape ke (B*N, k, 3) biar SVD bisa batch
+        BN = B * N
+        centred_flat = centred.reshape(BN, self.k, 3)           # (B*N, k, 3)
 
-        # Smallest eigenvector ↔ normal direction
-        # torch.linalg.eigh returns eigenvalues in ascending order
-        _, eigvecs = torch.linalg.eigh(cov)         # eigvecs: (B, N, 3, 3)
-        normals    = eigvecs[..., 0]                 # (B, N, 3)  — smallest eigval
+        # torch.linalg.svd: U(B*N,k,k), S(B*N,3), Vh(B*N,3,3)
+        # Normal = right singular vector terkecil = baris terakhir Vh
+        _, _, Vh = torch.linalg.svd(centred_flat, full_matrices=False)
+        normals  = Vh[:, -1, :]                                 # (B*N, 3)
+        normals  = normals.reshape(B, N, 3)                     # (B, N, 3)
 
         # Normalise
         normals = normals / (normals.norm(dim=-1, keepdim=True) + self.eps)

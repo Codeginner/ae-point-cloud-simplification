@@ -3,7 +3,7 @@ import numpy as np
 import open3d as o3d
 
 from .model import PointCloudSimplifier
-from .dataset import ModelNet40Dataset
+from .train import PointCloudDataset
 
 
 # ----------------------------------------------------------
@@ -29,7 +29,7 @@ model = PointCloudSimplifier(
 # ----------------------------------------------------------
 
 checkpoint = torch.load(
-    "PASTE_PATH_CHECKPOINT_DISINI",
+    "/kaggle/working/ae-point-cloud-simplification/checkpoints/best.pth", # change with your work dir
     map_location=device
 )
 
@@ -41,10 +41,10 @@ print(checkpoint.keys())
 # ----------------------------------------------------------
 
 # Kalau checkpoint punya key "model"
-model.load_state_dict(checkpoint["model"])
+# model.load_state_dict(checkpoint["model"])
 
 # Kalau error, ganti jadi:
-# model.load_state_dict(checkpoint)
+model.load_state_dict(checkpoint)
 
 model.eval()
 
@@ -53,8 +53,9 @@ model.eval()
 # Dataset
 # ----------------------------------------------------------
 
-dataset = ModelNet40Dataset(
-    split="test",
+dataset = PointCloudDataset(
+    data_root="./data",
+    mode="test",
     n_points=1024,
     augment=False
 )

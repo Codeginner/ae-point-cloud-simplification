@@ -149,43 +149,53 @@ def train_one_epoch(
     optimizer:   torch.optim.Optimizer,
     device:      torch.device,
     epoch:       int,
+    total_epochs: int,
     rank:        int,
     world_size:  int,
     logger:      logging.Logger,
 ) -> dict[str, float]:
+    from tqdm import tqdm
+
     model.train()
-    sampler.set_epoch(epoch)     # penting: biar shuffle berbeda tiap epoch
+    sampler.set_epoch(epoch)
 
     totals = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0}
 
-    for step, (P, _) in enumerate(loader):
-        P = P.to(device, non_blocking=True)      # (B, N, 3)
+    pbar = tqdm(
+        loader,
+        desc=f"[Train] Epoch {epoch+1}/{total_epochs}",
+        leave=False,
+        disable=(rank != 0),         # hanya rank 0 yang tampilkan progress bar
+        dynamic_ncols=True,
+    )
+
+    for step, (P, _) in enumerate(pbar):
+        P = P.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-
         out  = model(P, compute_loss=True)
         loss = out["loss"]
-
         loss["total"].backward()
-
-        # Gradient clipping — mencegah exploding gradient
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimizer.step()
 
-        # Accumulate (nilai sudah di-sync otomatis oleh DDP via backward)
         for k, v in loss.items():
             totals[k] += v.item()
 
-        if rank == 0 and step % 50 == 0:
-            logger.info(
-                f"Epoch {epoch}  step {step}/{len(loader)}  "
-                f"loss={loss['total'].item():.4f}  "
-                f"cd={loss['chamfer'].item():.4f}  "
-                f"n={loss['normal'].item():.4f}  "
-                f"nc={loss['nc'].item():.4f}"
-            )
+        # Update postfix tqdm dengan loss running average
+        if rank == 0:
+            avg_total = totals["total"] / (step + 1)
+            avg_cd    = totals["chamfer"] / (step + 1)
+            avg_n     = totals["normal"] / (step + 1)
+            avg_nc    = totals["nc"] / (step + 1)
+            pbar.set_postfix({
+                "loss": f"{avg_total:.4f}",
+                "cd":   f"{avg_cd:.4f}",
+                "n":    f"{avg_n:.4f}",
+                "nc":   f"{avg_nc:.4f}",
+            })
 
+    pbar.close()
     n = len(loader)
     return {k: v / n for k, v in totals.items()}
 
@@ -200,18 +210,36 @@ def validate(
     loader:     DataLoader,
     device:     torch.device,
     world_size: int,
+    rank:       int,
+    epoch:      int,
+    total_epochs: int,
 ) -> dict[str, float]:
+    from tqdm import tqdm
+
     model.eval()
     totals = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0}
 
-    for P, _ in loader:
+    pbar = tqdm(
+        loader,
+        desc=f"[Val]   Epoch {epoch+1}/{total_epochs}",
+        leave=False,
+        disable=(rank != 0),
+        dynamic_ncols=True,
+    )
+
+    for step, (P, _) in enumerate(pbar):
         P    = P.to(device, non_blocking=True)
         out  = model(P, compute_loss=True)
         loss = out["loss"]
         for k, v in loss.items():
             totals[k] += v.item()
 
-    # All-reduce agar semua rank punya angka yang sama
+        if rank == 0:
+            avg = totals["total"] / (step + 1)
+            pbar.set_postfix({"val_loss": f"{avg:.4f}"})
+
+    pbar.close()
+
     n = len(loader)
     local_avgs = {k: torch.tensor(v / n, device=device) for k, v in totals.items()}
     reduced    = reduce_dict(local_avgs, world_size)
@@ -225,6 +253,8 @@ def validate(
 @torch.no_grad()
 def run_test(args: argparse.Namespace) -> None:
     """Jalankan evaluasi tanpa DDP (single process)."""
+    from tqdm import tqdm
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[test] device={device}")
 
@@ -240,25 +270,33 @@ def run_test(args: argparse.Namespace) -> None:
     model = PointCloudSimplifier(M=args.M, k=args.k).to(device)
 
     assert args.resume is not None, "Test mode butuh --resume path/ke/checkpoint.pth"
-    ckpt = torch.load(args.resume, map_location=device)
+    ckpt  = torch.load(args.resume, map_location=device)
     state = ckpt["model"] if "model" in ckpt else ckpt
     model.load_state_dict(state)
-    print(f"[test] Loaded checkpoint dari {args.resume}")
+    print(f"[test] Loaded checkpoint: {args.resume}")
 
     model.eval()
     totals = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0}
 
-    for P, _ in val_loader:
+    pbar = tqdm(val_loader, desc="[Test]", dynamic_ncols=True)
+    for step, (P, _) in enumerate(pbar):
         P    = P.to(device)
         out  = model(P, compute_loss=True)
         loss = out["loss"]
         for k, v in loss.items():
             totals[k] += v.item()
+        avg = totals["total"] / (step + 1)
+        pbar.set_postfix({"loss": f"{avg:.4f}"})
+
+    pbar.close()
 
     n = len(val_loader)
-    print("\n=== TEST RESULTS ===")
+    print("\n" + "=" * 40)
+    print("TEST RESULTS")
+    print("=" * 40)
     for k, v in totals.items():
         print(f"  {k:10s}: {v / n:.6f}")
+    print("=" * 40)
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +304,8 @@ def run_test(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
+    from tqdm import tqdm
+
     setup_ddp(rank, world_size)
     device = torch.device(f"cuda:{rank}")
     logger = setup_logger(rank)
@@ -283,21 +323,17 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     # ── Model ─────────────────────────────────────────────────────────
     model = PointCloudSimplifier(M=args.M, k=args.k).to(device)
-
-    # Sync BatchNorm: biar BN statistics di-aggregate dari semua GPU
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
     model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    start_epoch = 0
+    start_epoch   = 0
     best_val_loss = float("inf")
 
     # ── Resume ────────────────────────────────────────────────────────
     if args.resume is not None:
-        # Load di rank 0, broadcast ke semua rank
         map_loc = {"cuda:0": f"cuda:{rank}"}
         ckpt    = torch.load(args.resume, map_location=map_loc)
         model.module.load_state_dict(ckpt["model"])
@@ -312,43 +348,69 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     if rank == 0:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Epoch progress bar (rank 0 only) ──────────────────────────────
+    epoch_range = range(start_epoch, args.epochs)
+    epoch_pbar  = tqdm(
+        epoch_range,
+        desc="Training",
+        disable=(rank != 0),
+        dynamic_ncols=True,
+        unit="epoch",
+    )
+
     # ── Training loop ─────────────────────────────────────────────────
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in epoch_pbar:
         train_losses = train_one_epoch(
             model, train_loader, train_sampler,
-            optimizer, device, epoch, rank, world_size, logger,
+            optimizer, device, epoch, args.epochs, rank, world_size, logger,
         )
-        val_losses = validate(model, val_loader, device, world_size)
-
+        val_losses = validate(
+            model, val_loader, device, world_size, rank, epoch, args.epochs,
+        )
         scheduler.step()
 
         if rank == 0:
+            lr_now = scheduler.get_last_lr()[0]
+
+            # Update outer epoch bar
+            epoch_pbar.set_postfix({
+                "train": f"{train_losses['total']:.4f}",
+                "val":   f"{val_losses['total']:.4f}",
+                "lr":    f"{lr_now:.1e}",
+                "best":  f"{best_val_loss:.4f}",
+            })
+
             logger.info(
-                f"[Epoch {epoch}/{args.epochs}]  "
+                f"[Epoch {epoch+1}/{args.epochs}]  "
                 f"train={train_losses['total']:.4f}  "
                 f"val={val_losses['total']:.4f}  "
-                f"lr={scheduler.get_last_lr()[0]:.2e}"
+                f"cd={val_losses['chamfer']:.4f}  "
+                f"n={val_losses['normal']:.4f}  "
+                f"nc={val_losses['nc']:.4f}  "
+                f"lr={lr_now:.2e}"
             )
 
-            # Save checkpoint — hanya rank 0
+            # Save checkpoint
             state_dict = model.module.state_dict()
             torch.save({
-                "epoch":          epoch,
-                "model":          state_dict,
-                "optimizer":      optimizer.state_dict(),
-                "scheduler":      scheduler.state_dict(),
-                "val_loss":       val_losses,
-                "best_val_loss":  best_val_loss,
-                "args":           vars(args),
+                "epoch":         epoch,
+                "model":         state_dict,
+                "optimizer":     optimizer.state_dict(),
+                "scheduler":     scheduler.state_dict(),
+                "val_loss":      val_losses,
+                "best_val_loss": best_val_loss,
+                "args":          vars(args),
             }, ckpt_dir / "latest.pth")
 
             if val_losses["total"] < best_val_loss:
                 best_val_loss = val_losses["total"]
                 torch.save(state_dict, ckpt_dir / "best.pth")
-                logger.info(f"  → New best val loss: {best_val_loss:.4f}")
+                logger.info(f"  ★ New best val loss: {best_val_loss:.4f}")
 
-        # Barrier: tunggu semua rank selesai sebelum epoch berikutnya
         dist.barrier()
+
+    if rank == 0:
+        epoch_pbar.close()
 
     cleanup_ddp()
 

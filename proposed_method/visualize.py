@@ -137,7 +137,7 @@ pcd_recon.translate((2.5, 0, 0))
 # ----------------------------------------------------------
 # Visualize
 # ----------------------------------------------------------
-
+'''
 o3d.visualization.draw_geometries(
     [
         pcd_original,
@@ -148,3 +148,80 @@ o3d.visualization.draw_geometries(
     width=1600,
     height=700
 )
+'''
+import matplotlib.pyplot as plt
+
+
+# ----------------------------------------------------------
+# Matplotlib visualization
+# ----------------------------------------------------------
+
+fig = plt.figure(figsize=(18, 6))
+
+
+# ----------------------------------------------------------
+# Original
+# ----------------------------------------------------------
+
+ax1 = fig.add_subplot(131, projection='3d')
+
+ax1.scatter(
+    P_original[:, 0],
+    P_original[:, 1],
+    P_original[:, 2],
+    s=1
+)
+
+ax1.set_title("Original")
+
+
+# ----------------------------------------------------------
+# Simplified
+# ----------------------------------------------------------
+
+ax2 = fig.add_subplot(132, projection='3d')
+
+ax2.scatter(
+    P_simplified[:, 0],
+    P_simplified[:, 1],
+    P_simplified[:, 2],
+    s=3
+)
+
+ax2.set_title("Simplified")
+
+
+# ----------------------------------------------------------
+# Reconstructed
+# ----------------------------------------------------------
+
+ax3 = fig.add_subplot(133, projection='3d')
+
+ax3.scatter(
+    P_recon[:, 0],
+    P_recon[:, 1],
+    P_recon[:, 2],
+    s=3
+)
+
+ax3.set_title("Reconstructed")
+
+
+# ----------------------------------------------------------
+# Remove axis
+# ----------------------------------------------------------
+
+for ax in [ax1, ax2, ax3]:
+
+    ax.set_axis_off()
+
+
+plt.tight_layout()
+
+plt.savefig(
+    "visualization_result.png",
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()

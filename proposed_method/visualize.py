@@ -65,7 +65,31 @@ dataset = PointCloudDataset(
 # Ambil 1 sample
 # ----------------------------------------------------------
 
-P, label = dataset[0]
+#P, label = dataset[0]
+
+# ----------------------------------------------------------
+# Find one chair sample
+# ----------------------------------------------------------
+
+chair_label = 2
+
+chair_idx = None
+
+for i in range(len(dataset)):
+
+    _, label = dataset[i]
+
+    if int(label) == chair_label:
+
+        chair_idx = i
+        break
+
+
+# ----------------------------------------------------------
+# Load chair sample
+# ----------------------------------------------------------
+
+P, label = dataset[chair_idx]
 
 P = P.unsqueeze(0).to(device)
 

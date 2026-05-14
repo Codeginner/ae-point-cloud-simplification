@@ -138,56 +138,66 @@ def reduce_dict(loss_dict: dict, world_size: int) -> dict:
     return reduced
 
 
-# ---------------------------------------------------------------------------
-# Training step
-# ---------------------------------------------------------------------------
-
 def train_one_epoch(
-    model:       DDP,
-    loader:      DataLoader,
-    sampler:     DistributedSampler,
-    optimizer:   torch.optim.Optimizer,
-    device:      torch.device,
-    epoch:       int,
+    model: DDP,
+    loader: DataLoader,
+    sampler: DistributedSampler,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
     total_epochs: int,
-    rank:        int,
-    world_size:  int,
-    logger:      logging.Logger,
+    rank: int,
+    world_size: int,
+    logger: logging.Logger,
 ) -> dict[str, float]:
+
     from tqdm import tqdm
 
     model.train()
     sampler.set_epoch(epoch)
 
-    totals = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0}
+    totals = {
+        "total": 0.0,
+        "chamfer": 0.0,
+        "normal": 0.0,
+        "nc": 0.0
+    }
 
+    # ONE EPOCH = ONE LINE
     pbar = tqdm(
-        loader,
-        desc=f"[Train] Epoch {epoch+1}/{total_epochs}",
-        leave=False,
-        disable=(rank != 0),         # hanya rank 0 yang tampilkan progress bar
+        total=len(loader),
+        desc=f"Train Epoch {epoch+1}/{total_epochs}",
+        disable=(rank != 0),
         dynamic_ncols=True,
+        position=0,
+        leave=True,
     )
 
-    for step, (P, _) in enumerate(pbar):
+    for step, (P, _) in enumerate(loader):
+
         P = P.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        out  = model(P, compute_loss=True)
+
+        out = model(P, compute_loss=True)
         loss = out["loss"]
+
         loss["total"].backward()
+
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
 
         for k, v in loss.items():
             totals[k] += v.item()
 
-        # Update postfix tqdm dengan loss running average
         if rank == 0:
+
             avg_total = totals["total"] / (step + 1)
             avg_cd    = totals["chamfer"] / (step + 1)
             avg_n     = totals["normal"] / (step + 1)
             avg_nc    = totals["nc"] / (step + 1)
+
             pbar.set_postfix({
                 "loss": f"{avg_total:.4f}",
                 "cd":   f"{avg_cd:.4f}",
@@ -195,8 +205,12 @@ def train_one_epoch(
                 "nc":   f"{avg_nc:.4f}",
             })
 
+            pbar.update(1)
+
     pbar.close()
+
     n = len(loader)
+
     return {k: v / n for k, v in totals.items()}
 
 
@@ -214,35 +228,64 @@ def validate(
     epoch:      int,
     total_epochs: int,
 ) -> dict[str, float]:
+
     from tqdm import tqdm
 
     model.eval()
-    totals = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0}
+
+    totals = {
+        "total": 0.0,
+        "chamfer": 0.0,
+        "normal": 0.0,
+        "nc": 0.0
+    }
 
     pbar = tqdm(
-        loader,
-        desc=f"[Val]   Epoch {epoch+1}/{total_epochs}",
-        leave=False,
+        total=len(loader),
+        desc=f"Val Epoch {epoch+1}/{total_epochs}",
         disable=(rank != 0),
         dynamic_ncols=True,
+        position=0,
+        leave=True,
     )
 
-    for step, (P, _) in enumerate(pbar):
-        P    = P.to(device, non_blocking=True)
-        out  = model(P, compute_loss=True)
+    for step, (P, _) in enumerate(loader):
+
+        P = P.to(device, non_blocking=True)
+
+        out = model(P, compute_loss=True)
         loss = out["loss"]
+
         for k, v in loss.items():
             totals[k] += v.item()
 
         if rank == 0:
-            avg = totals["total"] / (step + 1)
-            pbar.set_postfix({"val_loss": f"{avg:.4f}"})
+
+            avg_total = totals["total"] / (step + 1)
+            avg_cd    = totals["chamfer"] / (step + 1)
+            avg_n     = totals["normal"] / (step + 1)
+            avg_nc    = totals["nc"] / (step + 1)
+
+            pbar.set_postfix({
+                "loss": f"{avg_total:.4f}",
+                "cd":   f"{avg_cd:.4f}",
+                "n":    f"{avg_n:.4f}",
+                "nc":   f"{avg_nc:.4f}",
+            })
+
+            pbar.update(1)
 
     pbar.close()
 
     n = len(loader)
-    local_avgs = {k: torch.tensor(v / n, device=device) for k, v in totals.items()}
-    reduced    = reduce_dict(local_avgs, world_size)
+
+    local_avgs = {
+        k: torch.tensor(v / n, device=device)
+        for k, v in totals.items()
+    }
+
+    reduced = reduce_dict(local_avgs, world_size)
+
     return reduced
 
 

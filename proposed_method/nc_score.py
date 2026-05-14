@@ -105,54 +105,6 @@ Low NC score:
         return center_dist
 
     # ------------------------------------------------------------------
-    # Divide into contour / flat subsets  (LoGA's divide method)
-    # ------------------------------------------------------------------
-'''
-    def divide_point_cloud(
-        self,
-        points:      Tensor,
-        contour_num: int = 512,
-        flat_num:    int = 512,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Vectorised equivalent of LoGA's ``divide_point_cloud_by_center_distance``.
-
-        Splits the point cloud into:
-            • **contour** points — highest centre-distance (edges / corners)
-            • **flat** points   — lowest  centre-distance (smooth regions)
-
-        LoGA original uses a Python loop over batch items; this version
-        is fully batched.
-
-        Args:
-            points:      (B, N, 3) or (B, N, 6) — only xyz [:, :, :3] used.
-            contour_num: Points with largest  s_i. Default 512.
-            flat_num:    Points with smallest s_i. Default 512.
-
-        Returns:
-            flat_sets:       (B, flat_num,    3)
-            contour_sets:    (B, contour_num, 3)
-            flat_indices:    (B, flat_num)
-            contour_indices: (B, contour_num)
-            center_dist:     (B, N)  — raw per-point centre distances
-        """
-        pts         = points[:, :, :3]                              # (B, N, 3)
-        center_dist = self.estimate_center_distance(pts)            # (B, N)
-
-        # Sort descending: highest score first  (mirrors LoGA's argsort descending)
-        sorted_idx      = torch.argsort(center_dist, dim=1, descending=True)  # (B, N)
-        contour_indices = sorted_idx[:, :contour_num]              # (B, contour_num)
-        flat_indices    = sorted_idx[:, -flat_num:]                # (B, flat_num)
-
-        def _gather_pts(src: Tensor, idx: Tensor) -> Tensor:
-            """src: (B, N, 3), idx: (B, M) → (B, M, 3)"""
-            return torch.gather(src, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
-
-        contour_sets = _gather_pts(pts, contour_indices)           # (B, contour_num, 3)
-        flat_sets    = _gather_pts(pts, flat_indices)               # (B, flat_num,    3)
-
-        return flat_sets, contour_sets, flat_indices, contour_indices, center_dist
-    '''
-    # ------------------------------------------------------------------
     # Forward — normalised score for ImportanceScoringMLP
     # ------------------------------------------------------------------
 

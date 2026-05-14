@@ -1,37 +1,76 @@
-import sys
 import torch
 import numpy as np
 import open3d as o3d
 
-# ----------------------------------------------------------
-# Add project path
-# ----------------------------------------------------------
-
 from .model import PointCloudSimplifier
+from .dataset import ModelNet40Dataset
 
 
 # ----------------------------------------------------------
-# Initialize model
+# Device
+# ----------------------------------------------------------
+
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+
+# ----------------------------------------------------------
+# Load model
 # ----------------------------------------------------------
 
 model = PointCloudSimplifier(
     M=512
+).to(device)
+
+
+# ----------------------------------------------------------
+# Load checkpoint
+# ----------------------------------------------------------
+
+checkpoint = torch.load(
+    "PASTE_PATH_CHECKPOINT_DISINI",
+    map_location=device
 )
+
+print(checkpoint.keys())
+
+
+# ----------------------------------------------------------
+# Load weights
+# ----------------------------------------------------------
+
+# Kalau checkpoint punya key "model"
+model.load_state_dict(checkpoint["model"])
+
+# Kalau error, ganti jadi:
+# model.load_state_dict(checkpoint)
 
 model.eval()
 
 
 # ----------------------------------------------------------
-# Dummy point cloud
-# Replace later with real dataset sample
-# Shape = (1, N, 3)
+# Dataset
 # ----------------------------------------------------------
 
-P = torch.randn(1, 2048, 3)
+dataset = ModelNet40Dataset(
+    split="test",
+    n_points=1024,
+    augment=False
+)
 
 
 # ----------------------------------------------------------
-# Run full pipeline
+# Ambil 1 sample
+# ----------------------------------------------------------
+
+P, label = dataset[0]
+
+P = P.unsqueeze(0).to(device)
+
+
+# ----------------------------------------------------------
+# Inference
 # ----------------------------------------------------------
 
 with torch.no_grad():
@@ -46,7 +85,7 @@ with torch.no_grad():
 
 
 # ----------------------------------------------------------
-# Helper: numpy -> Open3D point cloud
+# Open3D helper
 # ----------------------------------------------------------
 
 def to_o3d(points, color):
@@ -66,22 +105,19 @@ def to_o3d(points, color):
 
 
 # ----------------------------------------------------------
-# Create point clouds
+# Build point clouds
 # ----------------------------------------------------------
 
-# Original = blue
 pcd_original = to_o3d(
     P_original,
     [0.2, 0.4, 1.0]
 )
 
-# Simplified = red
 pcd_simplified = to_o3d(
     P_simplified,
     [1.0, 0.2, 0.2]
 )
 
-# Reconstructed = green
 pcd_recon = to_o3d(
     P_recon,
     [0.2, 1.0, 0.2]
@@ -89,7 +125,7 @@ pcd_recon = to_o3d(
 
 
 # ----------------------------------------------------------
-# Shift clouds for side-by-side visualization
+# Shift clouds
 # ----------------------------------------------------------
 
 pcd_original.translate((-2.5, 0, 0))
@@ -108,6 +144,6 @@ o3d.visualization.draw_geometries(
         pcd_recon
     ],
     window_name="Original | Simplified | Reconstructed",
-    width=1400,
+    width=1600,
     height=700
 )

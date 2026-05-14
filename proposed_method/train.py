@@ -20,25 +20,105 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 # ---------------------------------------------------------------------------
-# Placeholder dataset  — replace with your actual dataset class
+# ModelNet10 Dataset
 # ---------------------------------------------------------------------------
 
-class PointCloudDataset(Dataset):
-    """Dummy dataset returning random point clouds.
+SUBSET_CLASSES = [
+    'bathtub', 'bed', 'chair', 'desk', 'dresser',
+    'monitor', 'night_stand', 'sofa', 'table', 'toilet'
+]
 
-    Replace with your actual ModelNet40 / ShapeNet / custom loader.
+class PointCloudDataset(Dataset):
+    """ModelNet10 subset dataset.
+
+    Membaca file .npy hasil download_modelnet10.py dengan struktur:
+        data_root/modelnet10/pcd/{mode}/0000.npy    — (2048, 3)
+        data_root/modelnet10/label/{mode}/0000.npy  — scalar 0-9
+
+    Args:
+        data_root:  Root folder data, default './data'.
+        mode:       'train' atau 'test'.
+        n_points:   Jumlah point yang dipakai per sampel. Jika < 2048,
+                    dilakukan random sampling. Default 1024.
+        augment:    Aktifkan augmentasi (random rotation + jitter)
+                    saat training. Default True.
     """
 
-    def __init__(self, n_samples: int = 1024, n_points: int = 2048) -> None:
-        self.n_samples = n_samples
-        self.n_points  = n_points
+    def __init__(
+        self,
+        data_root: str  = './data',
+        mode:      str  = 'train',
+        n_points:  int  = 1024,
+        augment:   bool = True,
+    ) -> None:
+        super().__init__()
+        assert mode in ('train', 'test'), "mode harus 'train' atau 'test'"
+        self.n_points = n_points
+        self.augment  = augment and (mode == 'train')
+
+        import glob
+        pcd_dir   = os.path.join(data_root, 'modelnet10', 'pcd',   mode)
+        label_dir = os.path.join(data_root, 'modelnet10', 'label', mode)
+
+        self.pcd_files   = sorted(glob.glob(os.path.join(pcd_dir,   '*.npy')))
+        self.label_files = sorted(glob.glob(os.path.join(label_dir, '*.npy')))
+
+        assert len(self.pcd_files) > 0, \
+            f"Tidak ada file di {pcd_dir}. Jalankan download_modelnet10.py dulu."
+        assert len(self.pcd_files) == len(self.label_files), \
+            "Jumlah file pcd dan label tidak sama."
+
+        logger.info(f"ModelNet10 [{mode}]: {len(self.pcd_files)} samples, "
+                    f"n_points={n_points}, augment={self.augment}")
 
     def __len__(self) -> int:
-        return self.n_samples
+        return len(self.pcd_files)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        # Returns: (N, 3)  — single point cloud
-        return torch.randn(self.n_points, 3)
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        import numpy as np
+
+        # Load
+        pcd   = np.load(self.pcd_files[idx]).astype('float32')   # (2048, 3)
+        label = np.load(self.label_files[idx])                    # scalar
+
+        # Random subsample
+        if self.n_points < len(pcd):
+            choice = np.random.choice(len(pcd), self.n_points, replace=False)
+            pcd    = pcd[choice]
+
+        # Normalise: zero-mean + unit sphere
+        pcd -= pcd.mean(axis=0)
+        scale = np.max(np.linalg.norm(pcd, axis=1))
+        pcd  /= (scale + 1e-8)
+
+        pcd = torch.from_numpy(pcd)                              # (n_points, 3)
+
+        # Augmentasi
+        if self.augment:
+            pcd = self._random_rotate(pcd)
+            pcd = self._random_jitter(pcd)
+
+        return pcd, torch.tensor(int(label), dtype=torch.long)
+
+    # ------------------------------------------------------------------
+    # Augmentasi
+    # ------------------------------------------------------------------
+
+    def _random_rotate(self, pcd: torch.Tensor) -> torch.Tensor:
+        """Rotasi random di sumbu Y (up-axis)."""
+        theta  = torch.rand(1) * 2 * torch.pi
+        cos_t, sin_t = theta.cos(), theta.sin()
+        R = torch.tensor([
+            [ cos_t, 0, sin_t],
+            [     0, 1,     0],
+            [-sin_t, 0, cos_t],
+        ], dtype=torch.float32).squeeze()
+        return pcd @ R.T
+
+    def _random_jitter(self, pcd: torch.Tensor, sigma: float = 0.01, clip: float = 0.05) -> torch.Tensor:
+        """Tambahkan Gaussian noise kecil ke setiap point."""
+        noise = torch.clamp(torch.randn_like(pcd) * sigma, -clip, clip)
+        return pcd + noise
 
 
 # ---------------------------------------------------------------------------
@@ -52,35 +132,24 @@ def train_one_epoch(
     device:     torch.device,
     epoch:      int,
 ) -> dict[str, float]:
-    """Run one full training epoch.
-
-    Args:
-        model:     The PointCloudSimplifier.
-        loader:    DataLoader yielding (B, N, 3) tensors.
-        optimizer: Torch optimiser.
-        device:    Compute device.
-        epoch:     Current epoch index (for logging).
-
-    Returns:
-        avg_losses: Dict of average loss values for this epoch.
-    """
     model.train()
     totals: dict[str, float] = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0}
 
-    for step, batch in enumerate(loader):
-        P: torch.Tensor = batch.to(device)      # (B, N, 3)
+    for step, (P, _) in enumerate(loader):          # unpack (pcd, label); label tidak dipakai
+        P = P.to(device)                             # (B, N, 3)
 
         optimizer.zero_grad()
 
-        out   = model(P, compute_loss=True)
-        loss  = out["loss"]
+        out  = model(P, compute_loss=True)
+        loss = out["loss"]
 
+        # .mean() untuk handle DataParallel yang return tensor per-GPU
         total_loss = loss["total"].mean()
         total_loss.backward()
         optimizer.step()
 
         for k, v in loss.items():
-            totals[k] += v.item()
+            totals[k] += v.mean().item()
 
         if step % 50 == 0:
             logger.info(
@@ -105,25 +174,15 @@ def validate(
     loader: DataLoader,
     device: torch.device,
 ) -> dict[str, float]:
-    """Evaluate on validation set.
-
-    Args:
-        model:  The PointCloudSimplifier in eval mode.
-        loader: Validation DataLoader.
-        device: Compute device.
-
-    Returns:
-        avg_losses: Dict of average validation losses.
-    """
     model.eval()
     totals: dict[str, float] = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0}
 
-    for batch in loader:
-        P: torch.Tensor = batch.to(device)
+    for P, _ in loader:                              # unpack (pcd, label)
+        P    = P.to(device)
         out  = model(P, compute_loss=True)
         loss = out["loss"]
         for k, v in loss.items():
-            totals[k] += v.item()
+            totals[k] += v.mean().item()
 
     n = len(loader)
     return {k: v / n for k, v in totals.items()}
@@ -135,48 +194,63 @@ def validate(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PointCloudSimplifier")
-    parser.add_argument("--data_root",    type=str,   default="./data")
-    parser.add_argument("--M",            type=int,   default=1024,  help="Simplified cloud size")
-    parser.add_argument("--k",            type=int,   default=20,    help="KNN neighbours")
+    parser.add_argument("--data_root",    type=str,   default="./data",
+                        help="Root folder data (berisi modelnet10/)")
+    parser.add_argument("--n_points",     type=int,   default=1024,
+                        help="Jumlah point per sampel")
+    parser.add_argument("--M",            type=int,   default=512,
+                        help="Jumlah output simplified points (harus <= n_points)")
+    parser.add_argument("--k",            type=int,   default=20,
+                        help="KNN neighbours")
     parser.add_argument("--epochs",       type=int,   default=200)
     parser.add_argument("--batch_size",   type=int,   default=16)
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--checkpoint",   type=str,   default="./checkpoints",
-                        help="Directory to save model checkpoints")
+    parser.add_argument("--num_workers",  type=int,   default=4)
+    parser.add_argument("--checkpoint",   type=str,   default="./checkpoints")
     parser.add_argument("--resume",       type=str,   default=None,
-                        help="Path to checkpoint to resume training from")
+                        help="Path ke checkpoint untuk resume training")
     return parser.parse_args()
 
 
 def main() -> None:
     args   = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    logger.info(f"Device: {device}  |  GPU count: {torch.cuda.device_count()}")
 
     # ── Data ──────────────────────────────────────────────────────────
-    train_ds = PointCloudDataset()          # TODO: replace with real dataset
-    val_ds   = PointCloudDataset(n_samples=256)
+    train_ds = PointCloudDataset(data_root=args.data_root, mode='train',
+                                 n_points=args.n_points, augment=True)
+    val_ds   = PointCloudDataset(data_root=args.data_root, mode='test',
+                                 n_points=args.n_points, augment=False)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=4)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=True,  num_workers=args.num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
+                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
+
+    logger.info(f"Train: {len(train_ds)} samples | Val: {len(val_ds)} samples")
 
     # ── Model ─────────────────────────────────────────────────────────
-    model = PointCloudSimplifier(M=args.M, k=args.k).to(device)
-    
+    model = PointCloudSimplifier(M=args.M, k=args.k)
+
     if torch.cuda.device_count() > 1:
-        print(f"Pakai {torch.cuda.device_count()} GPU")
+        logger.info(f"Pakai {torch.cuda.device_count()} GPU via DataParallel")
         model = torch.nn.DataParallel(model)
+
+    model = model.to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     start_epoch = 0
 
-    # Resume from checkpoint
+    # ── Resume ────────────────────────────────────────────────────────
     if args.resume is not None:
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model"])
+        # handle DataParallel wrapper
+        target = model.module if hasattr(model, 'module') else model
+        target.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
@@ -196,26 +270,25 @@ def main() -> None:
 
         logger.info(
             f"[Epoch {epoch}]  "
-            f"train_loss={train_losses['total']:.4f}  "
-            f"val_loss={val_losses['total']:.4f}  "
+            f"train={train_losses['total']:.4f}  "
+            f"val={val_losses['total']:.4f}  "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
 
-        # Save latest checkpoint
-        ckpt_path = ckpt_dir / "latest.pth"
+        # Save checkpoint — akses .module kalau DataParallel
         state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+
         torch.save({
             "epoch":     epoch,
-            "model":     model.state_dict(),
+            "model":     state_dict,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "val_loss":  val_losses,
-        }, ckpt_path)
+        }, ckpt_dir / "latest.pth")
 
-        # Save best checkpoint
         if val_losses["total"] < best_val_loss:
             best_val_loss = val_losses["total"]
-            torch.save(model.state_dict(), ckpt_dir / "best.pth")
+            torch.save(state_dict, ckpt_dir / "best.pth")
             logger.info(f"  → New best val loss: {best_val_loss:.4f}")
 
 

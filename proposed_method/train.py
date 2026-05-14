@@ -5,16 +5,14 @@ Usage:
     python -m proposed_method.train --data_root /path/to/dataset
 """
 import os
-
 import argparse
 import logging
 from pathlib import Path
-
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-
 from .model import PointCloudSimplifier
+from .visualize import visualize_point_clouds
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -188,6 +186,47 @@ def validate(
     n = len(loader)
     return {k: v / n for k, v in totals.items()}
 
+# ------------------------------------------------------------------
+# visualize 3d point cloud
+# ------------------------------------------------------------------
+
+@torch.no_grad()
+def visualize_results(
+    model: PointCloudSimplifier,
+    loader: DataLoader,
+    device: torch.device,
+    save_dir: str = "./visualizations",
+    num_samples: int = 3,
+) -> None:
+    """Visualize simplification results."""
+
+    model.eval()
+
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    for idx, batch in enumerate(loader):
+
+        if idx >= num_samples:
+            break
+
+        P: torch.Tensor = batch.to(device)
+
+        out = model(P, compute_loss=False)
+
+        P_original = P[0]
+        P_simple   = out["P_simplified"][0]
+
+        P_recon = None
+
+        if "P_recon" in out:
+            P_recon = out["P_recon"][0]
+
+        visualize_point_clouds(
+            original=P_original,
+            simplified=P_simple,
+            reconstructed=P_recon,
+            save_path=f"{save_dir}/sample_{idx}.png",
+        )
 
 # ---------------------------------------------------------------------------
 # Main training script
@@ -266,6 +305,15 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         train_losses = train_one_epoch(model, train_loader, optimizer, device, epoch)
         val_losses   = validate(model, val_loader, device)
+
+        if epoch % 10 == 0:
+            visualize_results(
+                model=model,
+                loader=val_loader,
+                device=device,
+                save_dir="./visualizations",
+                num_samples=1,
+            )
 
         scheduler.step()
 

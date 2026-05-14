@@ -3,7 +3,7 @@ import numpy as np
 import open3d as o3d
 
 from .model import PointCloudSimplifier
-from .dataset import ModelNet40Dataset
+#from .dataset import ModelNet40Dataset
 
 
 # ----------------------------------------------------------

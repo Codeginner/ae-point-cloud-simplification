@@ -134,25 +134,22 @@ class EdgeConvLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DGCNNEncoder(nn.Module):
-    """DGCNN encoder producing per-point features f_i.
+    """
+    Proposed-method DGCNN encoder.
 
-    Mirrors the EdgeConv × 4 + conv5 fusion block of Wang et al.'s
-    ``get_model.forward()`` but stops before the global pooling / MLP head,
-    returning per-point features instead of class logits.
+    Architecture:
+        EdgeConv1 : 64
+        EdgeConv2 : 128
+        EdgeConv3 : 256
 
-    Feature dimension per point:
-        x1: 64, x2: 64, x3: 128, x4: 256  →  concat: 512  →  conv5: emb_dims
-        Default emb_dims = 1024  (same as original).
-
-    Args:
-        k:        Number of KNN neighbours. Default 20.
-        emb_dims: Output embedding dimension. Default 1024.
+    Final feature:
+        concat(x1,x2,x3) -> 448 dim
     """
 
-    def __init__(self, k: int = 20, emb_dims: int = 1024) -> None:
+    def __init__(self, k: int = 20) -> None: #changed line
         super().__init__()
         self.k        = k
-        self.emb_dims = emb_dims
+        # self.emb_dims = emb_dims
 
         # EdgeConv blocks — in_channels = 2 × prev_out (edge feature concat)
         self.conv1 = nn.Sequential(
@@ -161,30 +158,43 @@ class DGCNNEncoder(nn.Module):
             nn.LeakyReLU(negative_slope=0.2),
         )
         self.conv2 = nn.Sequential(
-            nn.Conv2d(64*2,  64,  kernel_size=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(negative_slope=0.2),
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(64*2,  128, kernel_size=1, bias=False),
+            nn.Conv2d(64 * 2, 128, kernel_size=1, bias=False),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(negative_slope=0.2),
         )
-        self.conv4 = nn.Sequential(
-            nn.Conv2d(128*2, 256, kernel_size=1, bias=False),
+        #self.conv2 = nn.Sequential(
+        #    nn.Conv2d(64*2,  64,  kernel_size=1, bias=False),
+        #    nn.BatchNorm2d(64),
+        #    nn.LeakyReLU(negative_slope=0.2),
+        #)
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(128 * 2, 256, kernel_size=1, bias=False),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(negative_slope=0.2),
         )
+        #self.conv3 = nn.Sequential(
+        #    nn.Conv2d(64*2,  128, kernel_size=1, bias=False),
+        #    nn.BatchNorm2d(128),
+        #    nn.LeakyReLU(negative_slope=0.2),
+        #)
+        #self.conv4 = nn.Sequential(
+        #    nn.Conv2d(128*2, 256, kernel_size=1, bias=False),
+        #    nn.BatchNorm2d(256),
+        #    nn.LeakyReLU(negative_slope=0.2),
+        #)
 
         # Fusion: concat(x1,x2,x3,x4) = 64+64+128+256 = 512 → emb_dims
-        self.conv5 = nn.Sequential(
-            nn.Conv1d(512, emb_dims, kernel_size=1, bias=False),
-            nn.BatchNorm1d(emb_dims),
-            nn.LeakyReLU(negative_slope=0.2),
-        )
+        #self.conv5 = nn.Sequential(
+        #    nn.Conv1d(512, emb_dims, kernel_size=1, bias=False),
+        #    nn.BatchNorm1d(emb_dims),
+        #    nn.LeakyReLU(negative_slope=0.2),
+        #)
 
         # Expose EdgeConv blocks via ModuleList for the OOP diagram
-        self.layers = nn.ModuleList([self.conv1, self.conv2, self.conv3, self.conv4])
+        
+        #self.layers = nn.ModuleList([self.conv1, self.conv2, self.conv3, self.conv4])
+
+        self.layers = nn.ModuleList([self.conv1, self.conv2, self.conv3])
 
     def forward(self, P: Tensor) -> Tensor:
         """
@@ -209,12 +219,13 @@ class DGCNNEncoder(nn.Module):
         x3   = self.conv3(feat).max(dim=-1, keepdim=False)[0]  # (B, 128, N)
 
         # EdgeConv block 4
-        feat = get_graph_feature(x3, k=self.k)            # (B, 256, N, k)
-        x4   = self.conv4(feat).max(dim=-1, keepdim=False)[0]  # (B, 256, N)
+        # feat = get_graph_feature(x3, k=self.k)            # (B, 256, N, k)
+        # x4   = self.conv4(feat).max(dim=-1, keepdim=False)[0]  # (B, 256, N)
 
         # Multi-scale concat + fusion
-        x    = torch.cat((x1, x2, x3, x4), dim=1)        # (B, 512, N)
-        x    = self.conv5(x)                               # (B, emb_dims, N)
+        x = torch.cat((x1, x2, x3), dim=1)
+        # x    = torch.cat((x1, x2, x3, x4), dim=1)        # (B, 512, N)
+        # x    = self.conv5(x)                               # (B, emb_dims, N)
 
         f_i  = x.permute(0, 2, 1)                         # (B, N, emb_dims)
         return f_i

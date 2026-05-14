@@ -1,5 +1,16 @@
 """
-nc_score.py — NC Score Module, adapted from the LoGA attack.
+nc_score.py — Neighborhood Centrality (NC) Score module.
+
+Implements Eq. (3)–(5) from the proposed method:
+
+    c_i = (1/k) Σ p_j
+    s_i = ||p_i - c_i||
+    s_norm = min-max(s_i)
+
+The module computes geometry-aware local eccentricity scores
+used for:
+    • importance scoring
+    • contour/flat separation
 
 Original LoGA methods (faithfully preserved, just vectorised):
     estimate_center_distance()              → NCScoreModule.estimate_center_distance()
@@ -25,20 +36,15 @@ from torch import Tensor
 
 
 class NCScoreModule(nn.Module):
-    """Vectorised re-implementation of LoGA's centre-distance score.
+    """Neighborhood Centrality (NC) Score module.
 
-    Computes, for every point p_i:
+Computes per-point local geometric eccentricity scores.
 
-        s_i = || p_i  −  centroid( k-nearest-neighbours of p_i ) ||
+High NC score:
+    edge / contour points
 
-    then normalises per batch item to [0, 1].
-
-    Args:
-        k:   Number of neighbours for centroid estimation.
-             LoGA uses k=16 in ``estimate_center_distance`` and
-             k=20 in ``divide_point_cloud_by_center_distance``.
-             Unified here as a single parameter.
-        eps: Numerical stability for min-max normalisation. Default 1e-8.
+Low NC score:
+    flat / smooth surface points
     """
 
     def __init__(self, k: int = 16, eps: float = 1e-8) -> None:
@@ -101,7 +107,7 @@ class NCScoreModule(nn.Module):
     # ------------------------------------------------------------------
     # Divide into contour / flat subsets  (LoGA's divide method)
     # ------------------------------------------------------------------
-
+'''
     def divide_point_cloud(
         self,
         points:      Tensor,
@@ -145,7 +151,7 @@ class NCScoreModule(nn.Module):
         flat_sets    = _gather_pts(pts, flat_indices)               # (B, flat_num,    3)
 
         return flat_sets, contour_sets, flat_indices, contour_indices, center_dist
-
+    '''
     # ------------------------------------------------------------------
     # Forward — normalised score for ImportanceScoringMLP
     # ------------------------------------------------------------------

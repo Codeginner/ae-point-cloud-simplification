@@ -21,7 +21,7 @@ from .nc_score import NCScoreModule
 from .scoring  import ImportanceScoringMLP
 from .selector import AdaptiveSelector
 from .decoder  import FoldingNetDecoder
-from .visualize import visualize_point_clouds
+#from .visualize import visualize_point_clouds
 from .loss     import (
     GeometryAwareLoss,
     ChamferLoss,

@@ -410,6 +410,35 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         val_losses = validate(
             model, val_loader, device, world_size, rank, epoch, args.epochs,
         )
+
+        if rank == 0 and epoch % 10 == 0:
+            from proposed_method.visualize import visualize_point_clouds
+            
+            model.eval()
+            
+            batch = next(iter(val_loader))
+            
+            P, _ = batch
+            P = P.to(device)
+
+            with torch.no_grad():
+                out = model(P, compute_loss=False)
+
+            original   = P[0]
+            simplified = out["P_simplified"][0]
+
+            reconstructed = None
+
+            if "P_recon" in out:
+                reconstructed = out["P_recon"][0]
+
+            visualize_point_clouds(
+                original=original,
+                simplified=simplified,
+                reconstructed=reconstructed,
+                save_path=f"./visualizations/epoch_{epoch+1}.png",
+            )
+
         scheduler.step()
 
         if rank == 0:

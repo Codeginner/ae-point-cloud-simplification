@@ -412,7 +412,7 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         )
 
         if rank == 0 and epoch % 10 == 0:
-            from proposed_method.visualize import visualize_point_clouds
+            # from proposed_method.visualize import visualize_point_clouds
             
             model.eval()
             

@@ -4,6 +4,7 @@ train.py — Training loop for PointCloudSimplifier.
 Usage:
     python -m proposed_method.train --data_root /path/to/dataset
 """
+import os
 
 import argparse
 import logging

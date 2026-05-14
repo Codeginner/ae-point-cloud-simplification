@@ -12,7 +12,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from .model import PointCloudSimplifier
-from .visualize import visualize_point_clouds
+#from .visualize import visualize_point_clouds
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

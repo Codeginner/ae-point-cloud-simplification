@@ -410,9 +410,9 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         val_losses = validate(
             model, val_loader, device, world_size, rank, epoch, args.epochs,
         )
-
+        '''
         if rank == 0 and epoch % 10 == 0:
-            # from proposed_method.visualize import visualize_point_clouds
+            from proposed_method.visualize import visualize_point_clouds
             
             model.eval()
             
@@ -438,9 +438,9 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 reconstructed=reconstructed,
                 save_path=f"./visualizations/epoch_{epoch+1}.png",
             )
-
+        '''
         scheduler.step()
-
+        
         if rank == 0:
             lr_now = scheduler.get_last_lr()[0]
 

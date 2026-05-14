@@ -196,7 +196,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, default='./data')
     parser.add_argument('--url', type=str,
-                        default='https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip')
+                        default='https://huggingface.co/datasets/Msun/modelnet40/resolve/main/modelnet40_ply_hdf5_2048.zip')
     args = parser.parse_args()
 
     main(args.url, args.data_root)

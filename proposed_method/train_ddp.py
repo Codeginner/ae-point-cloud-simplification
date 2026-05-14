@@ -287,7 +287,7 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     # Sync BatchNorm: biar BN statistics di-aggregate dari semua GPU
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
+    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)

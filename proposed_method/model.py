@@ -59,7 +59,12 @@ class PointCloudSimplifier(nn.Module):
 
         # --- Sub-modules ---
         self.encoder   = DGCNNEncoder(k=k)
+
+        # NCScoreModule tidak punya learnable params — register tapi freeze
+        # supaya DDP tidak expect gradient dari module ini
         self.nc_module = NCScoreModule(k=k)
+        for p in self.nc_module.parameters():
+            p.requires_grad_(False)
 
         self.scorer    = ImportanceScoringMLP(
             in_dim=1025,         # 1024 (emb_dims) + 1 (NC score)

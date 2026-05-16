@@ -1,18 +1,25 @@
 """
-selector.py — Adaptive Geometry-Balanced Selector.
+selector.py — Adaptive Geometry-Balanced Selector with STE.
 
 Implements Eq. (10)–(14) from the proposed method.
 
-The selector partitions the point cloud into:
-    • contour points (high NC score)
-    • flat points    (low NC score)
+Key improvement over the original:
+    The original used a Python for-loop over the batch and hard top-k,
+    making it:
+        1. Slow — serialised over batch, not parallelisable on GPU
+        2. Non-differentiable — gradient from reconstruction never
+           reached the ImportanceScoringMLP
 
-Then independently selects:
-    • top-M_c contour points
-    • top-M_f flat points
+    This version:
+        1. Fully vectorised — no Python loop, runs entirely on GPU
+        2. Differentiable via Straight-Through Estimator (STE)
+           Forward : hard top-k selection (same discrete output)
+           Backward: gradient flows through soft scores to the scorer
 
-using importance scores, and merges them into the final
-simplified point cloud.
+    STE trick used here:
+        scale = score_selected / score_selected.detach()   ≈ 1.0
+        P_s   = P_s_hard * scale.unsqueeze(-1)
+        → values unchanged in forward, gradient reaches scorer in backward
 
 Class:
     AdaptiveSelector
@@ -25,28 +32,12 @@ from torch import Tensor
 
 class AdaptiveSelector(nn.Module):
     """
-    Adaptive Geometry-Balanced Selector.
-
-    Proposed-method version:
-        • contour pool selection
-        • flat pool selection
-        • NC-guided balancing
+    Adaptive Geometry-Balanced Selector (vectorised + STE).
 
     Args:
-        M:
-            Number of output simplified points.
-
-        alpha:
-            Fraction allocated to contour region.
-            Default:
-                alpha = 0.7
-
-        threshold:
-            NC threshold separating:
-                contour vs flat
-
-            Default:
-                threshold = 0.5
+        M         : Number of output simplified points.
+        alpha     : Fraction allocated to contour region. Default 0.7.
+        threshold : NC threshold separating contour vs flat. Default 0.5.
     """
 
     def __init__(
@@ -56,174 +47,107 @@ class AdaptiveSelector(nn.Module):
         threshold: float = 0.5,
     ) -> None:
         super().__init__()
-
         self.M = M
         self.alpha = alpha
         self.threshold = threshold
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-
-    # ini bagian yang diubah
     def forward(
         self,
         P: Tensor,
         score: Tensor,
         nc_score: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         """
-        Select M points using geometry-balanced selection.
+        Select M points using geometry-balanced selection with STE.
 
         Args:
-            P:
-                Input point cloud
-                shape = (B, N, 3)
-
-            score:
-                Importance score
-                shape = (B, N)
-
-            nc_score:
-                Normalized NC score
-                shape = (B, N)
+            P        : Input point cloud   (B, N, 3)
+            score    : Importance scores   (B, N)   — requires_grad=True
+            nc_score : NC scores           (B, N)
 
         Returns:
-            idx:
-                Selected point indices
-                shape = (B, M)
+            idx : Selected indices         (B, M)   — for gathering features
+            P_s : Simplified point cloud   (B, M, 3) — differentiable via STE
         """
 
         B, N, _ = P.shape
-        M = self.M
-        device = P.device
+        M_c = int(self.alpha * self.M)
+        M_f = self.M - M_c
 
-        # --------------------------------------------------------------
-        # Eq. (11)
-        # M_c = contour budget
-        # M_f = flat budget
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # 1. Build masked scores — vectorised, no Python loop
+        #    Contour mask applied to score: flat points get -inf for contour
+        #    pool, contour points get -inf for flat pool.
+        # ------------------------------------------------------------------
 
-        # ini bagian yang diubah
-        M_c = int(self.alpha * M)
+        contour_mask = nc_score >= self.threshold          # (B, N)
 
-        # ini bagian yang diubah
-        M_f = M - M_c
+        NEG_INF = torch.finfo(score.dtype).min
 
-        idx_list = []
+        # Scores visible to contour pool (flat points blocked)
+        s_contour = score.masked_fill(~contour_mask, NEG_INF)
+        # Scores visible to flat pool (contour points blocked)
+        s_flat    = score.masked_fill(contour_mask,  NEG_INF)
 
-        for b in range(B):
+        # Fallback: if an entire sample has all -inf in one pool, use full score
+        all_flat    = (~contour_mask).all(dim=1, keepdim=True)   # (B,1) bool
+        all_contour = contour_mask.all(dim=1, keepdim=True)
+        s_contour = torch.where(all_flat,    score, s_contour)
+        s_flat    = torch.where(all_contour, score, s_flat)
 
-            # ----------------------------------------------------------
-            # Current batch scores
-            # ----------------------------------------------------------
+        # ------------------------------------------------------------------
+        # 2. Hard top-k selection (non-differentiable, used in forward only)
+        # ------------------------------------------------------------------
 
-            # ini bagian yang diubah
-            s = score[b]
+        _, idx_c = s_contour.topk(M_c, dim=1, largest=True, sorted=False)  # (B, M_c)
+        _, idx_f = s_flat.topk(M_f,    dim=1, largest=True, sorted=False)  # (B, M_f)
 
-            # ini bagian yang diubah
-            nc = nc_score[b]
+        idx = torch.cat([idx_c, idx_f], dim=1)   # (B, M)
 
-            # ----------------------------------------------------------
-            # Eq. (10)
-            # Split contour vs flat
-            # ----------------------------------------------------------
+        # ------------------------------------------------------------------
+        # 3. Gather simplified points (hard, non-differentiable path)
+        # ------------------------------------------------------------------
 
-            # ini bagian yang diubah
-            contour_mask = nc >= self.threshold
+        P_s_hard = P.gather(1, idx.unsqueeze(-1).expand(-1, -1, 3))  # (B, M, 3)
 
-            # ini bagian yang diubah
-            flat_mask = nc < self.threshold
+        # ------------------------------------------------------------------
+        # 4. Straight-Through Estimator (STE)
+        #
+        #    Problem  : P_s_hard = index_points(P, idx)
+        #               The integer-index gather has no gradient w.r.t. score.
+        #               Scorer MLP never receives loss signal from reconstruction.
+        #
+        #    Solution : Multiply P_s by a scale factor that is 1.0 in the
+        #               forward pass but carries gradient in the backward pass.
+        #
+        #       selected_scores = score.gather(1, idx)          (B, M)
+        #       scale           = s / s.detach()                ≈ 1.0
+        #       P_s             = P_s_hard * scale.unsqueeze(-1)
+        #
+        #    → Forward : P_s == P_s_hard  (numerically identical)
+        #    → Backward: dL/d(score_i) ≠ 0  for all selected i
+        #                Gradient flows: loss → P_recon → decoder
+        #                                     → P_s → scale → score → scorer
+        # ------------------------------------------------------------------
 
-            # ini bagian yang diubah
-            contour_idx = torch.where(contour_mask)[0]
+        selected_scores = score.gather(1, idx)                          # (B, M)
 
-            # ini bagian yang diubah
-            flat_idx = torch.where(flat_mask)[0]
+        # ------------------------------------------------------------------
+        # Straight-Through Estimator (STE) — CORRECTED FORMULA
+        #
+        # Previous (wrong):
+        #   scale = s / s.detach().clamp(1e-8)
+        #   P_s   = P_s_hard * scale
+        #   → When scorer outputs small values (near 0), scale ≈ 0
+        #     → P_s collapses toward origin → NaN in loss after a few epochs
+        #
+        # Correct (additive STE):
+        #   P_s = P_s_hard + (s - s.detach())
+        #   Forward : (s - s.detach()) == 0  → P_s == P_s_hard  ✓
+        #   Backward: dL/ds = dL/dP_s        → gradient flows to scorer ✓
+        #   No numerical instability regardless of score magnitude.
+        # ------------------------------------------------------------------
 
-            # ----------------------------------------------------------
-            # Edge-case fallback
-            # Prevent empty pools
-            # ----------------------------------------------------------
+        P_s = P_s_hard + (selected_scores.unsqueeze(-1) - selected_scores.unsqueeze(-1).detach())
 
-            # ini bagian yang ditambahkan
-            if contour_idx.numel() == 0:
-                contour_idx = torch.arange(N, device=device)
-
-            # ini bagian yang ditambahkan
-            if flat_idx.numel() == 0:
-                flat_idx = torch.arange(N, device=device)
-
-            # ----------------------------------------------------------
-            # Gather scores from each pool
-            # ----------------------------------------------------------
-
-            # ini bagian yang ditambahkan
-            contour_scores = s[contour_idx]
-
-            # ini bagian yang ditambahkan
-            flat_scores = s[flat_idx]
-
-            # ----------------------------------------------------------
-            # Eq. (12)
-            # Top-k contour selection
-            # ----------------------------------------------------------
-
-            # ini bagian yang diubah
-            top_contour = contour_scores.topk(
-                min(M_c, contour_scores.numel()),
-                largest=True
-            ).indices
-
-            # ini bagian yang ditambahkan
-            selected_contour = contour_idx[top_contour]
-
-            # ----------------------------------------------------------
-            # Eq. (13)
-            # Top-k flat selection
-            # ----------------------------------------------------------
-
-            # ini bagian yang diubah
-            top_flat = flat_scores.topk(
-                min(M_f, flat_scores.numel()),
-                largest=True
-            ).indices
-
-            # ini bagian yang ditambahkan
-            selected_flat = flat_idx[top_flat]
-
-            # ----------------------------------------------------------
-            # Eq. (14)
-            # Merge contour + flat
-            # ----------------------------------------------------------
-
-            # ini bagian yang diubah
-            combined = torch.cat(
-                [
-                    selected_contour,
-                    selected_flat
-                ],
-                dim=0
-            )
-
-            # ----------------------------------------------------------
-            # Padding if selected points < M
-            # ----------------------------------------------------------
-
-            # ini bagian yang ditambahkan
-            if combined.numel() < M:
-
-                pad = combined.repeat(
-                    (M // combined.numel()) + 1
-                )[:M - combined.numel()]
-
-                combined = torch.cat(
-                    [combined, pad],
-                    dim=0
-                )
-
-            idx_list.append(combined[:M])
-
-        idx = torch.stack(idx_list, dim=0)
-
-        return idx
+        return idx, P_s

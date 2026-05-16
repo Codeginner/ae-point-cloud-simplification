@@ -123,6 +123,16 @@ class NormalConsistencyLoss(nn.Module):
         normals  = Vh[:, -1, :]                                 # (B*N, 3)
         normals  = normals.reshape(B, N, 3)                     # (B, N, 3)
 
+        # Guard: SVD can return NaN when neighbourhood is degenerate
+        # (e.g., all k neighbours at the exact same position).
+        # Replace any NaN normal with a safe default (0,0,1).
+        normals = torch.nan_to_num(normals, nan=0.0)
+        # Ensure no zero-norm normals after nan replacement
+        fallback = torch.zeros_like(normals)
+        fallback[..., 2] = 1.0                                  # (0,0,1) default
+        zero_mask = (normals.norm(dim=-1, keepdim=True) < self.eps)
+        normals = torch.where(zero_mask, fallback, normals)
+
         # Normalise
         normals = normals / (normals.norm(dim=-1, keepdim=True) + self.eps)
         return normals
@@ -139,10 +149,16 @@ class NormalConsistencyLoss(nn.Module):
         n_recon = self._estimate_normals(P_recon)    # (B, M, 3)
         n_input = self._estimate_normals(P_input)    # (B, N, 3)
 
-        # Match recon normals to nearest input normals
-        # Use spatial proximity: find nearest input point for each recon point
-        # Simple mean approximation — override with nearest-neighbour match if needed
-        dot = (n_recon * n_input[:, :n_recon.shape[1], :]).sum(dim=-1)  # (B, M)
+        # BUG FIX: use nearest-neighbour matching instead of first-M-points truncation.
+        # For each reconstructed point find the spatially closest input point's normal.
+        with torch.no_grad():
+            diff   = P_recon.unsqueeze(2) - P_input.unsqueeze(1)   # (B, M, N, 3)
+            dists  = (diff ** 2).sum(dim=-1)                        # (B, M, N)
+            nn_idx = dists.argmin(dim=-1)                           # (B, M)
+            nn_idx_exp = nn_idx.unsqueeze(-1).expand(-1, -1, 3)     # (B, M, 3)
+
+        n_matched = n_input.gather(1, nn_idx_exp)                   # (B, M, 3)
+        dot = (n_recon * n_matched).sum(dim=-1)                     # (B, M)
         L_n = (1.0 - dot.abs()).mean()
         return L_n
 
@@ -181,10 +197,16 @@ class NCScorePreservLoss(nn.Module):
         s_recon = self.nc_scorer(P_recon)   # (B, M)
         s_input = self.nc_scorer(P_input)   # (B, N)
 
-        # Match: for each recon point find its closest input point score
-        # Simple: align by first M points of input (override with NN match if needed)
-        M = P_recon.shape[1]
-        s_target = s_input[:, :M]            # (B, M)
+        # BUG FIX: use nearest-neighbour matching instead of first-M-points truncation.
+        # For each reconstructed point find its closest input point and use that NC score.
+        # P_recon: (B, M, 3),  P_input: (B, N, 3)
+        with torch.no_grad():
+            diff   = P_recon.unsqueeze(2) - P_input.unsqueeze(1)   # (B, M, N, 3)
+            dists  = (diff ** 2).sum(dim=-1)                        # (B, M, N)
+            nn_idx = dists.argmin(dim=-1)                           # (B, M)
+
+        # Gather matching NC scores from input cloud
+        s_target = s_input.gather(1, nn_idx)                        # (B, M)
 
         L_nc = ((s_recon - s_target) ** 2).mean()
         return L_nc
@@ -195,16 +217,29 @@ class NCScorePreservLoss(nn.Module):
 # ---------------------------------------------------------------------------
 
 class GeometryAwareLoss(nn.Module):
-    """Weighted combination of the three geometry-aware loss components.
+    """Weighted combination of geometry-aware loss components.
 
-        L_total = λ1·L_cd + λ2·L_n + λ3·L_nc
+        L_total = λ1·L_cd + λ2·L_n + λ3·L_nc + λ4·L_score
+
+    Components
+    ----------
+    L_cd    : Chamfer Distance between P_recon and P_input.
+    L_n     : Normal Consistency between P_recon and P_input.
+    L_nc    : NC Score Preservation (simplified ↔ input NC scores).
+    L_score : Score Supervision — auxiliary signal so scorer receives
+              gradient even without STE (safety net / warmup helper).
+
+    Note: The primary gradient path to the scorer is now through STE
+    in AdaptiveSelector (P_s carries grad through scale factor).
+    L_score provides an additional direct signal.
 
     Args:
-        lambda_1: Weight for Chamfer Distance.             Default 1.0.
-        lambda_2: Weight for Normal Consistency.           Default 0.5.
-        lambda_3: Weight for NC Score Preservation.        Default 0.3.
-        k_normal: KNN for normal estimation.               Default 10.
-        k_nc:     KNN for NC score computation.            Default 20.
+        lambda_1: Weight for Chamfer Distance.       Default 1.0.
+        lambda_2: Weight for Normal Consistency.     Default 0.5.
+        lambda_3: Weight for NC Score Preservation.  Default 0.3.
+        lambda_4: Weight for Score Supervision.      Default 0.3.
+        k_normal: KNN for normal estimation.         Default 10.
+        k_nc    : KNN for NC score computation.      Default 20.
     """
 
     def __init__(
@@ -212,6 +247,7 @@ class GeometryAwareLoss(nn.Module):
         lambda_1: float = 1.0,
         lambda_2: float = 0.5,
         lambda_3: float = 0.3,
+        lambda_4: float = 0.3,
         k_normal: int   = 10,
         k_nc:     int   = 20,
     ) -> None:
@@ -219,33 +255,54 @@ class GeometryAwareLoss(nn.Module):
         self.lambda_1 = lambda_1
         self.lambda_2 = lambda_2
         self.lambda_3 = lambda_3
+        self.lambda_4 = lambda_4
 
         self.chamfer_loss = ChamferLoss()
         self.normal_loss  = NormalConsistencyLoss(k=k_normal)
         self.nc_loss      = NCScorePreservLoss(k=k_nc)
 
-    def forward(self, P_recon: Tensor, P_input: Tensor) -> dict[str, Tensor]:
+    def forward(
+        self,
+        P_recon: Tensor,
+        P_input: Tensor,
+        P_simplified: Tensor,
+        score: Tensor,
+    ) -> dict[str, Tensor]:
         """
         Args:
-            P_recon: Reconstructed point cloud  (B, M, 3).
-            P_input: Original input point cloud (B, N, 3).
+            P_recon      : Reconstructed cloud  (B, M, 3).
+            P_input      : Original input cloud (B, N, 3).
+            P_simplified : Simplified cloud     (B, M, 3).
+            score        : Importance scores    (B, N).
 
         Returns:
-            loss_dict: {
-                'total':   L_total,
-                'chamfer': L_cd,
-                'normal':  L_n,
-                'nc':      L_nc,
-            }
+            loss_dict: total, chamfer, normal, nc, score keys.
         """
-        L_cd  = self.chamfer_loss(P_recon, P_input)
-        L_n   = self.normal_loss(P_recon, P_input)
-        L_nc  = self.nc_loss(P_recon, P_input)
+        L_cd = self.chamfer_loss(P_recon, P_input)
+        L_n  = self.normal_loss(P_recon, P_input)
+        L_nc = self.nc_loss(P_recon, P_input)
+
+        # ------------------------------------------------------------------
+        # L_score : Score Supervision Loss
+        #
+        # Target: how far is each input point from the nearest simplified
+        # point, normalised to [0, 1] per sample.
+        # High target → point was far from simplified set → should have been
+        # selected → scorer should have given it a high importance score.
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            diff   = P_input.unsqueeze(2) - P_simplified.unsqueeze(1)  # (B,N,M,3)
+            dist   = (diff ** 2).sum(-1).min(dim=2).values              # (B, N)
+            d_max  = dist.max(dim=1, keepdim=True).values.clamp(1e-8)
+            target = dist / d_max                                        # (B, N) ∈ [0,1]
+
+        L_score = torch.nn.functional.mse_loss(score, target)
 
         L_total = (
             self.lambda_1 * L_cd
             + self.lambda_2 * L_n
             + self.lambda_3 * L_nc
+            + self.lambda_4 * L_score
         )
 
         return {
@@ -253,4 +310,5 @@ class GeometryAwareLoss(nn.Module):
             "chamfer": L_cd,
             "normal":  L_n,
             "nc":      L_nc,
+            "score":   L_score,
         }

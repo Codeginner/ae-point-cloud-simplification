@@ -15,7 +15,6 @@ Class:
     FoldingNetDecoder
 """
 
-import math
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -88,12 +87,13 @@ class FoldingNetDecoder(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # 2D grid
+        # BUG FIX: seed_dim changed from 2 (fixed 2D grid) to 3 (P_s xyz).
+        # The decoder now uses the actual simplified point positions as fold
+        # seeds instead of a canonical 2D grid, so the output is anchored to
+        # the correct 3D orientation of the input cloud.
         # --------------------------------------------------------------
 
-        self.grid_size = math.ceil(math.sqrt(M))
-
-        grid_dim = 2
+        seed_dim = 3   # x, y, z from P_s
 
         # --------------------------------------------------------------
         # Folding stages
@@ -103,13 +103,13 @@ class FoldingNetDecoder(nn.Module):
 
             # ----------------------------------------------------------
             # Fold Stage 1
-            # concat(grid, z)
+            # concat(P_s_xyz, z)   — was concat(2D_grid, z)
             # ----------------------------------------------------------
 
             nn.Sequential(
 
                 nn.Conv1d(
-                    grid_dim + latent_dim,
+                    seed_dim + latent_dim,
                     512,
                     1
                 ),
@@ -133,7 +133,7 @@ class FoldingNetDecoder(nn.Module):
 
             # ----------------------------------------------------------
             # Fold Stage 2
-            # concat(fold1, z)
+            # concat(fold1, z)  — unchanged
             # ----------------------------------------------------------
 
             nn.Sequential(
@@ -161,56 +161,6 @@ class FoldingNetDecoder(nn.Module):
                 ),
             ),
         ])
-
-    # ------------------------------------------------------------------
-    # Build 2D Grid
-    # ------------------------------------------------------------------
-
-    def _build_grid(
-        self,
-        B: int,
-        device: torch.device,
-    ) -> Tensor:
-        """
-        Build 2D regular grid.
-
-        Returns:
-            grid:
-                shape = (B,2,M)
-        """
-
-        gs = self.grid_size
-
-        lin = torch.linspace(
-            -0.5,
-            0.5,
-            gs,
-            device=device
-        )
-
-        gy, gx = torch.meshgrid(
-            lin,
-            lin,
-            indexing="ij"
-        )
-
-        grid = torch.stack(
-            [
-                gx.flatten(),
-                gy.flatten()
-            ],
-            dim=0
-        )
-
-        grid = grid[:, :self.M]
-
-        grid = grid.unsqueeze(0).expand(
-            B,
-            -1,
-            -1
-        )
-
-        return grid
 
     # ------------------------------------------------------------------
     # Forward
@@ -268,54 +218,57 @@ class FoldingNetDecoder(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # 3. Build 2D grid
+        # BUG FIX: use P_s xyz as the fold seed instead of a fixed 2D
+        # grid.  The original code built a canonical grid in [-0.5, 0.5]²
+        # which has no orientation information — because DGCNN is
+        # approximately rotation-invariant the decoder always reconstructed
+        # in a fixed canonical pose, regardless of how the input was
+        # oriented.
+        #
+        # Now:
+        #   seed = P_s.permute(0,2,1)   shape: (B, 3, M)
+        #
+        # Stage 1 input: concat(P_s_xyz, z_tiled)  → (B, 3+1024, M)
+        # Stage 2 input: concat(fold1_out, z_tiled) → (B, 3+1024, M)
+        # Final output:  fold2_out + P_s_transposed  (residual)
+        #   → the network predicts per-point *offsets* from P_s, not
+        #     absolute positions.  This makes learning easier and keeps
+        #     the reconstruction anchored at the correct 3D location.
         # --------------------------------------------------------------
 
-        grid = self._build_grid(
-            B,
-            device
-        )
+        seed = P_s.permute(0, 2, 1)        # (B, 3, M)
 
         # --------------------------------------------------------------
-        # 4. Folding Stage 1
+        # 3. Folding Stage 1
+        # concat(P_s_xyz, z_tiled) → (B, 3+1024, M)
         # --------------------------------------------------------------
 
         fold1_input = torch.cat(
-            [
-                grid,
-                z_tiled
-            ],
+            [seed, z_tiled],
             dim=1
         )
 
-        fold1_out = self.fold_layers[0](
-            fold1_input
-        )
+        fold1_out = self.fold_layers[0](fold1_input)   # (B, 3, M)
 
         # --------------------------------------------------------------
-        # 5. Folding Stage 2
+        # 4. Folding Stage 2
+        # concat(fold1, z_tiled) → (B, 3+1024, M)
         # --------------------------------------------------------------
 
         fold2_input = torch.cat(
-            [
-                fold1_out,
-                z_tiled
-            ],
+            [fold1_out, z_tiled],
             dim=1
         )
 
-        fold2_out = self.fold_layers[1](
-            fold2_input
-        )
+        fold2_out = self.fold_layers[1](fold2_input)   # (B, 3, M)
 
         # --------------------------------------------------------------
-        # Final reconstructed point cloud
+        # 5. Residual: decode offsets from P_s, not absolute positions
+        # P_recon = P_s + predicted_offsets
         # --------------------------------------------------------------
 
-        P_recon = fold2_out.permute(
-            0,
-            2,
-            1
-        )
+        P_recon = fold2_out + seed         # (B, 3, M)
+
+        P_recon = P_recon.permute(0, 2, 1)  # (B, M, 3)
 
         return P_recon

@@ -12,7 +12,9 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from .model import PointCloudSimplifier
-#from .visualize import visualize_point_clouds
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -209,24 +211,29 @@ def visualize_results(
         if idx >= num_samples:
             break
 
-        P: torch.Tensor = batch.to(device)
+        # BUG FIX: batch is a (pcd, label) tuple — cannot call .to() on a tuple
+        P, _ = batch
+        P = P.to(device)
 
         out = model(P, compute_loss=False)
 
-        P_original = P[0]
-        P_simple   = out["P_simplified"][0]
+        P_original = P[0].cpu().numpy()
+        P_simple   = out["P_simplified"][0].cpu().numpy()
+        P_recon    = out["P_recon"][0].cpu().numpy() if "P_recon" in out else None
 
-        P_recon = None
-
-        if "P_recon" in out:
-            P_recon = out["P_recon"][0]
-
-        visualize_point_clouds(
-            original=P_original,
-            simplified=P_simple,
-            reconstructed=P_recon,
-            save_path=f"{save_dir}/sample_{idx}.png",
-        )
+        # BUG FIX: visualize_point_clouds was not imported; use matplotlib directly
+        fig = plt.figure(figsize=(15, 5))
+        titles  = ["Original", "Simplified", "Reconstructed"]
+        clouds  = [P_original, P_simple, P_recon]
+        for col, (title, pts) in enumerate(zip(titles, clouds)):
+            ax = fig.add_subplot(1, 3, col + 1, projection="3d")
+            if pts is not None:
+                ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=1)
+            ax.set_title(title)
+            ax.set_axis_off()
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/sample_{idx}.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
 # ---------------------------------------------------------------------------
 # Main training script

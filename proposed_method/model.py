@@ -58,6 +58,7 @@ class PointCloudSimplifier(nn.Module):
         lambda_1: float = 1.0,
         lambda_2: float = 0.5,
         lambda_3: float = 0.3,
+        lambda_4: float = 0.5,
     ) -> None:
 
         super().__init__()
@@ -124,6 +125,7 @@ class PointCloudSimplifier(nn.Module):
             lambda_1=lambda_1,
             lambda_2=lambda_2,
             lambda_3=lambda_3,
+            lambda_4=lambda_4,
         )
 
     # ------------------------------------------------------------------
@@ -184,27 +186,19 @@ class PointCloudSimplifier(nn.Module):
         # idx shape = (B,M)
         # --------------------------------------------------------------
 
-        # ini bagian yang diubah
-        idx = self.selector(
-            P,
-            score,
-            s_i
-        )
-
         # --------------------------------------------------------------
-        # 5. Gather simplified points
+        # 4. Adaptive Geometry-Balanced Selection  (vectorised + STE)
+        #    Returns idx  (B, M)   — integer indices for feature gather
+        #            P_s  (B, M, 3) — differentiable via STE
         # --------------------------------------------------------------
 
-        P_s = index_points(
-            P,
-            idx
-        )                                           # (B,M,3)
+        idx, P_s = self.selector(P, score, s_i)
 
-        # ini bagian yang diubah
-        f_s = index_points(
-            f_i,
-            idx
-        )                                           # (B,M,448)
+        # --------------------------------------------------------------
+        # 5. Gather simplified features
+        # --------------------------------------------------------------
+
+        f_s = index_points(f_i, idx)            # (B, M, 448)
 
         # --------------------------------------------------------------
         # 6. FoldingNet Reconstruction
@@ -238,7 +232,9 @@ class PointCloudSimplifier(nn.Module):
 
             loss_dict = self.loss_fn(
                 P_recon,
-                P
+                P,
+                P_s,
+                score,
             )
 
             out["loss"] = loss_dict

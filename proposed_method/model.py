@@ -27,7 +27,7 @@ from .selector import AdaptiveSelector
 from .decoder import FoldingNetDecoder
 from .loss import GeometryAwareLoss
 from .utils import index_points
-
+from .classification_head import GeometryAwareClassifier
 
 class PointCloudSimplifier(nn.Module):
     """
@@ -128,6 +128,14 @@ class PointCloudSimplifier(nn.Module):
             lambda_4=lambda_4,
         )
 
+        #head
+        self.classifier = GeometryAwareClassifier(
+            feature_dim=448,
+            emb_dim=256,
+            num_classes=num_classes,
+            k=16
+        )
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -208,6 +216,11 @@ class PointCloudSimplifier(nn.Module):
             P_s,
             f_s
         )                                           # (B,M,3)
+
+        logits = self.classifier(
+            reconstructed_points,
+            selected_features
+        )
 
         # --------------------------------------------------------------
         # Output dictionary
